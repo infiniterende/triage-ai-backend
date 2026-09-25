@@ -1121,7 +1121,7 @@ async def process_triage(
         )
 
 
-@app.route("/api/health", methods=["GET"])
+@app.get("/api/health", methods=["GET"])
 def health_check():
     """Health check endpoint"""
     return jsonify(
@@ -1133,7 +1133,7 @@ def health_check():
     )
 
 
-@app.route("/api/questions", methods=["GET"])
+@app.get("/api/questions", methods=["GET"])
 def get_questions():
     """Get all triage questions"""
     return jsonify(
