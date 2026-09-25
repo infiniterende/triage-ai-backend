@@ -42,7 +42,10 @@ import uuid
 from sqlalchemy.orm import Session
 from fastapi.security import OAuth2PasswordRequestForm
 from models import Doctor, Patient, ChatSession, Message, Base
-from auth import verify_password, create_access_token
+from jose import JWTError, jwt
+
+from auth import create_access_token
+from auth_api import verify_password
 
 from livekit import api
 from livekit.api import LiveKitAPI, ListRoomsRequest
@@ -59,6 +62,7 @@ from pathways.api import extract_findings, router as pathway_router
 from pathways.extraction import extract_with_keywords, transcript_from_messages
 from care_api import router as care_router
 from auth_api import router as auth_router
+from voice_api import router as voice_router
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -105,6 +109,7 @@ async def unhandled_exception_handler(request, exc):
 app.include_router(pathway_router)
 app.include_router(care_router)
 app.include_router(auth_router)
+app.include_router(voice_router)
 
 
 def run_and_store_pathway(
@@ -149,11 +154,6 @@ class UserResponse(BaseModel):
 class AssessmentRequest(BaseModel):
     responses: List[UserResponse]
     session_id: str
-
-
-class VoiceRequest(BaseModel):
-    session_id: str
-    responses: List[Dict[str, Any]]
 
 
 class AppointmentRequest(BaseModel):
@@ -846,398 +846,6 @@ async def health_check():
     return {"status": "healthy", "service": "AI Health Assistant"}
 
 
-class ChestPainTriageSystem:
-    def __init__(self):
-        self.risk_factors = {
-            "crushing": 3,
-            "pressure": 3,
-            "elephant": 3,
-            "radiating": 2,
-            "shortness": 2,
-            "sweating": 2,
-            "diaphoresis": 2,
-            "nausea": 1,
-            "heart_disease": 3,
-            "diabetes": 2,
-            "smoking": 1,
-            "severe_pain": 2,
-            "worst_pain": 3,
-            "dying": 3,
-            "arm_pain": 2,
-            "jaw_pain": 2,
-            "back_pain": 1,
-        }
-
-        self.questions = [
-            "Can you describe your chest pain? Is it sharp, crushing, burning, or pressure-like?",
-            "When did the pain start? Is it constant or does it come and go?",
-            "On a scale of 1 to 10, how severe is your pain?",
-            "Do you have any shortness of breath, nausea, sweating, or pain radiating to your arm, jaw, or back?",
-            "Do you have any history of heart disease, diabetes, high blood pressure, or smoking?",
-            "Are you currently taking any medications, especially heart medications?",
-            "Have you had similar episodes before? If so, what happened?",
-            "Are you experiencing any dizziness, lightheadedness, or feeling faint?",
-        ]
-
-        self.emergency_keywords = [
-            r"can\'?t breathe|cannot breathe|difficulty breathing",
-            r"worst pain|never felt pain like this|most severe",
-            r"think I\'?m dying|feel like I\'?m dying|going to die",
-            r"crushing|elephant on chest|heavy weight",
-            r"heart attack|having a heart attack",
-            r"chest tightness with sweating",
-            r"pain down.*arm|arm pain with chest|jaw pain with chest",
-        ]
-
-        self.medical_patterns = {
-            "crushing_pain": r"crushing|elephant|heavy pressure|weight on chest|vice",
-            "pressure_pain": r"pressure|tight|squeezing|band around chest|constricting",
-            "radiating_pain": r"radiating|spreading|arm pain|jaw pain|back pain|left arm|shoulder pain",
-            "associated_symptoms": r"short of breath|can\'?t breathe|breathing difficulty|dyspnea",
-            "autonomic_symptoms": r"sweating|diaphoresis|clammy|cold sweat|nausea|vomiting",
-            "cardiac_history": r"heart disease|cardiac|coronary|heart attack|myocardial|angina|stent|bypass",
-            "risk_factors": r"diabetes|diabetic|smoking|high blood pressure|hypertension",
-            "severity_high": r"10.*10|worst pain|unbearable|excruciating|severe",
-            "duration": r"(\d+)\s*(minute|hour|day)s?\s*ago|started\s*(\d+)",
-        }
-
-    def analyze_transcript(
-        self, transcript: str, conversation_context: Dict = None
-    ) -> Dict:
-        """Analyze the patient's transcript for medical risk factors"""
-        transcript_lower = transcript.lower()
-        risk_score = 0
-        detected_factors = []
-
-        # Check for emergency keywords first
-        for pattern in self.emergency_keywords:
-            if re.search(pattern, transcript_lower):
-                return {
-                    "risk_score": 10,
-                    "risk_level": "emergency",
-                    "is_emergency": True,
-                    "detected_factors": ["emergency_keywords"],
-                    "recommendation": "EMERGENCY: Call 911 immediately or go to the nearest emergency room. Do not drive yourself.",
-                }
-
-        # Analyze medical patterns
-        for factor, pattern in self.medical_patterns.items():
-            if re.search(pattern, transcript_lower):
-                if factor == "crushing_pain":
-                    risk_score += self.risk_factors["crushing"]
-                    detected_factors.append("crushing chest pain")
-                elif factor == "pressure_pain":
-                    risk_score += self.risk_factors["pressure"]
-                    detected_factors.append("pressure-type chest pain")
-                elif factor == "radiating_pain":
-                    risk_score += self.risk_factors["radiating"]
-                    detected_factors.append("radiating pain")
-                elif factor == "associated_symptoms":
-                    risk_score += self.risk_factors["shortness"]
-                    detected_factors.append("breathing difficulty")
-                elif factor == "autonomic_symptoms":
-                    risk_score += self.risk_factors["sweating"]
-                    detected_factors.append("associated symptoms")
-                elif factor == "cardiac_history":
-                    risk_score += self.risk_factors["heart_disease"]
-                    detected_factors.append("cardiac history")
-                elif factor == "risk_factors":
-                    risk_score += self.risk_factors["diabetes"]
-                    detected_factors.append("cardiovascular risk factors")
-                elif factor == "severity_high":
-                    risk_score += self.risk_factors["severe_pain"]
-                    detected_factors.append("severe pain")
-
-        # Extract pain severity score if mentioned
-        severity_match = re.search(r"(\d+)\s*(?:out of|/|\s)\s*10", transcript_lower)
-        if severity_match:
-            severity = int(severity_match.group(1))
-            if severity >= 8:
-                risk_score += 3
-                detected_factors.append(f"severe pain ({severity}/10)")
-            elif severity >= 6:
-                risk_score += 2
-                detected_factors.append(f"moderate-severe pain ({severity}/10)")
-
-        # Determine risk level
-        if risk_score >= 6:
-            risk_level = "emergency"
-            is_emergency = True
-        elif risk_score >= 4:
-            risk_level = "high"
-            is_emergency = False
-        elif risk_score >= 2:
-            risk_level = "medium"
-            is_emergency = False
-        else:
-            risk_level = "low"
-            is_emergency = False
-
-        return {
-            "risk_score": risk_score,
-            "risk_level": risk_level,
-            "is_emergency": is_emergency,
-            "detected_factors": detected_factors,
-        }
-
-    def get_recommendation(self, analysis: Dict, question_count: int) -> str:
-        """Generate appropriate medical recommendation based on risk analysis"""
-        risk_level = analysis["risk_level"]
-
-        if risk_level == "emergency":
-            return "Based on your symptoms, this appears to be a medical emergency. Call 911 immediately or have someone drive you to the nearest emergency room. Do not drive yourself. Time is critical for heart attacks."
-
-        elif risk_level == "high":
-            return "Your symptoms are concerning and suggest you should seek immediate medical attention. Please go to an emergency room or call 911 if symptoms worsen. Do not wait - chest pain with these characteristics needs urgent evaluation."
-
-        elif risk_level == "medium":
-            return "Your symptoms warrant prompt medical evaluation. Please contact your doctor immediately or visit an urgent care center within the next 2-4 hours. If symptoms worsen or you develop new symptoms, go to the emergency room."
-
-        else:  # low risk
-            if question_count < 3:
-                return "Thank you for that information. While your symptoms may be lower risk, chest pain should always be evaluated by a healthcare professional. Let me ask a few more questions to better assess your situation."
-            else:
-                return "Based on our discussion, your symptoms appear to be lower risk, but chest pain should still be evaluated by a healthcare professional. Please schedule an appointment with your primary care doctor within the next day or two. If symptoms worsen, seek immediate care."
-
-    def get_next_question(self, question_count: int, analysis: Dict) -> Optional[str]:
-        """Get the next appropriate question based on current assessment"""
-        if analysis["is_emergency"] or question_count >= len(self.questions):
-            return None
-
-        return self.questions[question_count]
-
-
-# Initialize triage system
-triage_system = ChestPainTriageSystem()
-
-
-@app.post("/api/transcribe")
-async def transcribe(audio: UploadFile = File(...)):
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
-            tmp.write(await audio.read())
-            tmp_path = tmp.name
-
-        with open(tmp_path, "rb") as f:
-            resp = client.audio.transcriptions.create(
-                model="whisper-1", file=f, response_format="text"
-            )
-
-        transcript = resp.strip()
-
-        os.remove(tmp_path)
-        print(transcript)
-        return {"transcript": transcript}
-
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.post("/api/triage")
-async def process_triage(
-    audio: UploadFile = File(...), conversation_context: str = Form("{}")
-):
-    try:
-        # Parse conversation context
-        context = json.loads(conversation_context)
-
-        # Save uploaded audio to temp file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_file:
-            content = await audio.read()
-            temp_file.write(content)
-            temp_filename = temp_file.name
-
-        try:
-            with open(tmp_path, "rb") as audio_file:
-                result = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    language="en",
-                    temperature=0.0,
-                )
-            transcript = (
-                result.strip()
-                if isinstance(result, str)
-                else result.get("text", "").strip()
-            )
-            if not transcript:
-                return JSONResponse({"error": "No speech detected"}, status_code=400)
-
-            # Append user message to conversation history
-            context.setdefault("messages", []).append(
-                {"sender": "user", "text": transcript}
-            )
-
-            # Analyze transcript if needed
-            analysis = triage_system.analyze_transcript(transcript, context)
-
-            # Count agent questions asked
-            question_count = len(
-                [m for m in context["messages"] if m["sender"] == "agent"]
-            )
-
-            recommendation = triage_system.get_recommendation(analysis, question_count)
-
-            # Build ChatGPT messages from conversation history for context
-            chat_messages = [
-                {"role": "system", "content": "You are a helpful medical assistant."},
-            ]
-            for m in context["messages"]:
-                role = "assistant" if m["sender"] == "agent" else "user"
-                chat_messages.append({"role": role, "content": m["text"]})
-
-            # Get ChatGPT response for next agent message (question or reply)
-            chat_response = client.chat.completions.create(
-                model="gpt-4",
-                messages=chat_messages,
-                temperature=0.7,
-            )
-            assistant_reply = chat_response.choices[0].message.content.strip()
-
-            # Append agent reply to conversation history
-            context["messages"].append({"sender": "agent", "text": assistant_reply})
-
-            response = {
-                "transcript": transcript,
-                "assistant_reply": assistant_reply,
-                "risk_score": analysis["risk_score"],
-                "risk_level": analysis["risk_level"],
-                "recommendation": recommendation,
-                "timestamp": datetime.now().isoformat(),
-                "conversation_context": context,  # return updated conversation for frontend
-            }
-
-            # Delay 5 seconds before returning to simulate pause (optional)
-            await asyncio.sleep(5)
-
-        finally:
-            if os.path.exists(temp_filename):
-                os.remove(temp_filename)
-
-    except Exception as e:
-        logger.error(f"Error processing triage request: {str(e)}")
-        return JSONResponse(
-            content={"error": f"Processing failed: {str(e)}"}, status_code=500
-        )
-
-
-@app.get("/api/health", methods=["GET"])
-def health_check():
-    """Health check endpoint"""
-    return jsonify(
-        {
-            "status": "healthy",
-            "model": "whisper-base",
-            "timestamp": datetime.now().isoformat(),
-        }
-    )
-
-
-@app.get("/api/questions", methods=["GET"])
-def get_questions():
-    """Get all triage questions"""
-    return jsonify(
-        {
-            "questions": triage_system.questions,
-            "total_questions": len(triage_system.questions),
-        }
-    )
-
-
-@app.post("/voice/transcribe")
-async def transcribe_audio(audio: UploadFile = File(...)):
-    """Transcribe audio using OpenAI Whisper"""
-    try:
-        # Read audio file
-        audio_data = await audio.read()
-
-        # Use OpenAI Whisper for transcription
-        response = client.Audio.transcribe(
-            model="whisper-1", file=io.BytesIO(audio_data), response_format="text"
-        )
-
-        return {"transcription": response}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/voice/generate-speech")
-async def generate_speech(text: str):
-    """Generate speech from text using OpenAI TTS"""
-    try:
-        response = client.Audio.speech.create(model="tts-1", voice="nova", input=text)
-
-        return {"audio_url": "data:audio/mp3;base64," + response.content}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/voice/chat")
-async def voice_chat(request: VoiceRequest):
-    """Handle voice conversation with ChatGPT"""
-    try:
-        # Create conversation context
-        messages = [
-            {
-                "role": "system",
-                "content": """You are a medical AI assistant conducting a chest pain assessment. 
-                Ask one question at a time from this list, in order:
-                1. What is your age?
-                2. Are you male or female?
-                3. How would you describe your chest pain? Is it crushing, stabbing, burning, or aching?
-                4. On a scale of 1-10, how severe is your chest pain?
-                5. When did the chest pain start?
-                6. Does the pain radiate to your arm, jaw, neck, or back?
-                7. Are you experiencing shortness of breath?
-                8. Are you feeling nauseous or have you vomited?
-                9. Are you sweating more than usual?
-                10. Do you have a history of heart disease?
-                11. Do you have diabetes?
-                12. Do you smoke or have you smoked in the past?
-                13. Do you have high blood pressure?
-                
-                Keep questions brief and clear. Wait for the user's response before asking the next question.
-                """,
-            }
-        ]
-
-        # Add previous conversation
-        for response in request.responses:
-            if response.get("role") == "assistant":
-                messages.append({"role": "assistant", "content": response["content"]})
-            elif response.get("role") == "user":
-                messages.append({"role": "user", "content": response["content"]})
-
-        # Get ChatGPT response
-        chat_response = client.ChatCompletion.create(
-            model="gpt-4", messages=messages, max_tokens=150, temperature=0.7
-        )
-
-        response_text = chat_response.choices[0].message.content
-
-        return {"response": response_text}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/assess")
-async def assess_risk(request: AssessmentRequest):
-    """Assess heart attack risk based on responses"""
-    try:
-        assessment = calculate_heart_attack_risk(request.responses)
-
-        # Store session data
-        sessions[request.session_id] = {
-            "responses": [r.dict() for r in request.responses],
-            "assessment": assessment,
-            "timestamp": datetime.now().isoformat(),
-        }
-
-        return assessment
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 # Generate a unique room name that's not taken yet
 async def generate_room_name():
     name = "room-" + str(uuid.uuid4())[:8]
@@ -1274,7 +882,7 @@ async def get_token(name: str = Query(...), room: str = Query(default=None)):
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 SECRET_KEY = os.getenv("SECRET_KEY")
-ALGORITHM = os.getenv("ALGORITHM")
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
 
 
 def get_current_doctor(token: str = Depends(oauth2_scheme)):
@@ -1300,9 +908,14 @@ def login(
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = create_access_token({"sub": doctor.email})
-    return {"access_token": token, doctor: doctor, "token_type": "bearer"}
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "doctor": {"id": doctor.id, "name": doctor.name, "email": doctor.email},
+    }
 
 
 if __name__ == "__main__":
+    import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
