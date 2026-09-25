@@ -1,13 +1,15 @@
 """
-Agilance voice agent (LiveKit + OpenAI Realtime).
+Agilance voice agent (LiveKit Agents 1.x + OpenAI Realtime, GA API).
 
 Run locally:   python agent.py dev
-Production:    python agent.py start        (Render worker, see render.yaml)
+Production:    python agent.py start        (Render background worker)
 
-Every patient/agent utterance is persisted (voice_sessions, voice_transcripts,
-chat_sessions/messages) so the patient and clinician dashboards can show the
-conversation, and when the session ends the clinical pathway engine evaluates
-the transcript and stores a PathwayEvaluation linked to the patient record.
+The patient's speech is transcribed by OpenAI inside the realtime session and
+forwarded to the web app (legacy transcription events and lk.transcription
+text streams), so the browser's live transcript panel fills in as they talk.
+Every utterance is persisted (voice_sessions, voice_transcripts,
+chat_sessions/messages) and, when the call ends, the clinical pathway engine
+evaluates the transcript and stores a PathwayEvaluation linked to the patient.
 """
 
 from __future__ import annotations
@@ -15,14 +17,25 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
-from typing import Any, Optional
+from typing import Optional
 
 from dotenv import load_dotenv
-from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli, llm
-from livekit.agents.multimodal import MultimodalAgent
+from livekit.agents import (
+    Agent,
+    AgentSession,
+    ConversationItemAddedEvent,
+    JobContext,
+    RoomInputOptions,
+    RoomOutputOptions,
+    RunContext,
+    UserInputTranscribedEvent,
+    WorkerOptions,
+    cli,
+    function_tool,
+)
 from livekit.plugins import openai
 
-from api import AssistantFnc
+from api import PatientTools
 from db import SessionLocal
 from models import (
     ChatSession,
@@ -43,15 +56,12 @@ load_dotenv()
 logger = logging.getLogger("agilance-voice")
 
 
-def _message_text(msg: llm.ChatMessage) -> str:
-    content: Any = msg.content
-    if isinstance(content, list):
-        return "\n".join("[image]" if isinstance(x, llm.ChatImage) else str(x) for x in content)
-    return str(content or "")
-
+# --------------------------------------------------------------------------- #
+# Persistence
+# --------------------------------------------------------------------------- #
 
 class VoiceSessionRecorder:
-    """Synchronous DB writes, called from the event loop via run_in_executor."""
+    """Synchronous DB writes; the agent calls these through asyncio.to_thread."""
 
     def __init__(self, room_name: str, participant_identity: str) -> None:
         self.room_name = room_name
@@ -60,7 +70,6 @@ class VoiceSessionRecorder:
         self._chat_session_id: Optional[int] = None
         self._voice_session_id: Optional[int] = None
 
-    # ------------------------------------------------------------------ #
     def start(self) -> None:
         with SessionLocal() as db:
             voice = db.query(VoiceSession).filter_by(session_id=self.room_name).first()
@@ -80,7 +89,7 @@ class VoiceSessionRecorder:
         logger.info("voice session %s started for %s", self.room_name, self.participant_identity)
 
     def record(self, speaker: str, text: str) -> None:
-        text = text.strip()
+        text = (text or "").strip()
         if not text:
             return
         role = "assistant" if speaker == "agent" else "user"
@@ -164,58 +173,119 @@ class VoiceSessionRecorder:
         )
 
 
+# --------------------------------------------------------------------------- #
+# Agent
+# --------------------------------------------------------------------------- #
+
+class TriageAgent(Agent):
+    def __init__(self, tools: PatientTools) -> None:
+        super().__init__(instructions=INSTRUCTIONS)
+        self._patient_tools = tools
+
+    @function_tool()
+    async def save_patient_assessment(
+        self,
+        context: RunContext,
+        name: str,
+        age: int,
+        sex: str,
+        phone_number: str,
+        pain_quality: str,
+        substernal: bool,
+        radiates_to_arm_or_jaw: bool,
+        exertional: bool,
+        relieved_by_rest: bool,
+        ongoing: bool,
+        shortness_of_breath: bool,
+        sweating: bool,
+        nausea: bool,
+        hypertension: bool,
+        diabetes: bool,
+        hyperlipidemia: bool,
+        smoking: bool,
+        heart_disease: bool,
+    ) -> str:
+        """Save the patient's chest pain assessment once you have their answers,
+        and get the risk level and recommendation to read back to them.
+
+        Args:
+            name: Patient's name.
+            age: Age in years.
+            sex: "male" or "female".
+            phone_number: Phone number, or an empty string.
+            pain_quality: pressure, sharp, burning, tearing or dull.
+            substernal: Pain in the centre of the chest / behind the breastbone.
+            radiates_to_arm_or_jaw: Pain spreads to the arm, jaw or neck.
+            exertional: Brought on by physical activity or stress.
+            relieved_by_rest: Eases within minutes of resting.
+            ongoing: The pain is happening right now.
+            shortness_of_breath: Short of breath.
+            sweating: Sweating or clammy with the pain.
+            nausea: Nausea or vomiting.
+            hypertension: History of high blood pressure.
+            diabetes: History of diabetes.
+            hyperlipidemia: History of high cholesterol.
+            smoking: Current or past smoker.
+            heart_disease: Known heart disease, prior heart attack, stent or bypass.
+        """
+        return await asyncio.to_thread(
+            self._patient_tools.save_patient_assessment,
+            name=name, age=age, sex=sex, phone_number=phone_number, pain_quality=pain_quality,
+            substernal=substernal, radiates_to_arm_or_jaw=radiates_to_arm_or_jaw,
+            exertional=exertional, relieved_by_rest=relieved_by_rest, ongoing=ongoing,
+            shortness_of_breath=shortness_of_breath, sweating=sweating, nausea=nausea,
+            hypertension=hypertension, diabetes=diabetes, hyperlipidemia=hyperlipidemia,
+            smoking=smoking, heart_disease=heart_disease,
+        )
+
+
 async def entrypoint(ctx: JobContext) -> None:
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    await ctx.connect()
     participant = await ctx.wait_for_participant()
 
-    loop = asyncio.get_running_loop()
     recorder = VoiceSessionRecorder(ctx.room.name, participant.identity)
     try:
-        await loop.run_in_executor(None, recorder.start)
+        await asyncio.to_thread(recorder.start)
     except Exception:  # never let persistence problems stop the call
         logger.exception("could not start voice session record")
 
-    assistant_fnc = AssistantFnc(room_name=ctx.room.name, participant_name=participant.identity)
+    tools = PatientTools(room_name=ctx.room.name, participant_name=participant.identity)
 
-    model = openai.realtime.RealtimeModel(
-        instructions=INSTRUCTIONS,
-        voice="shimmer",
-        temperature=0.7,
-        modalities=["audio", "text"],
-        # Whisper transcription of the patient's audio is what the web app's
-        # live transcript panel displays (forwarded by MultimodalAgent).
-        input_audio_transcription=openai.realtime.InputTranscriptionOptions(model="whisper-1"),
+    session = AgentSession(
+        llm=openai.realtime.RealtimeModel(model="gpt-realtime", voice="shimmer"),
     )
-    assistant = MultimodalAgent(model=model, fnc_ctx=assistant_fnc)
 
-    def _persist(speaker: str, msg: llm.ChatMessage) -> None:
-        text = _message_text(msg)
-        fut = loop.run_in_executor(None, recorder.record, speaker, text)
-        fut.add_done_callback(
-            lambda f: f.exception() and logger.error("persist failed: %s", f.exception())
+    def _persist(speaker: str, text: str) -> None:
+        task = asyncio.create_task(asyncio.to_thread(recorder.record, speaker, text))
+        task.add_done_callback(
+            lambda t: t.exception() and logger.error("persist failed: %s", t.exception())
         )
 
-    @assistant.on("user_speech_committed")
-    def _on_user(msg: llm.ChatMessage) -> None:
-        _persist("patient", msg)
+    @session.on("user_input_transcribed")
+    def _on_user(ev: UserInputTranscribedEvent) -> None:
+        if ev.is_final:
+            _persist("patient", ev.transcript)
 
-    @assistant.on("agent_speech_committed")
-    def _on_agent(msg: llm.ChatMessage) -> None:
-        _persist("agent", msg)
+    @session.on("conversation_item_added")
+    def _on_item(ev: ConversationItemAddedEvent) -> None:
+        if ev.item.role == "assistant":
+            _persist("agent", ev.item.text_content or "")
 
     async def _finish() -> None:
         try:
-            await loop.run_in_executor(None, recorder.finish, assistant_fnc.patient_id)
+            await asyncio.to_thread(recorder.finish, tools.patient_id)
         except Exception:
             logger.exception("could not finalise voice session")
 
     ctx.add_shutdown_callback(_finish)
 
-    assistant.start(ctx.room, participant)
-
-    session = model.sessions[0]
-    session.conversation.item.create(llm.ChatMessage(role="assistant", content=WELCOME_MESSAGE))
-    session.response.create()
+    await session.start(
+        agent=TriageAgent(tools),
+        room=ctx.room,
+        room_input_options=RoomInputOptions(participant_identity=participant.identity),
+        room_output_options=RoomOutputOptions(transcription_enabled=True),
+    )
+    await session.generate_reply(instructions=WELCOME_MESSAGE)
 
 
 if __name__ == "__main__":

@@ -1,18 +1,16 @@
 """
-Function tools available to the voice agent (LiveKit ``FunctionContext``).
+Tool implementation shared by the voice agent (see agent.py, where it is
+exposed to the model as a `function_tool`).
 
-The Realtime model calls ``save_patient_assessment`` once it has collected the
-patient's details; the tool stores the record, runs the clinical pathway
-engine on the structured answers and returns the disposition so the agent can
-read it back to the patient.
+`save_patient_assessment` stores the patient record, runs the clinical
+pathway engine on the structured answers and returns the disposition so the
+agent can read it back to the patient.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Annotated, Optional
-
-from livekit.agents import llm
+from typing import Optional
 
 from db import SessionLocal
 from models import Patient
@@ -21,41 +19,34 @@ from pathways import ClinicalFindings, run_pathway
 logger = logging.getLogger("agilance-voice.tools")
 
 
-class AssistantFnc(llm.FunctionContext):
+class PatientTools:
     def __init__(self, room_name: str = "", participant_name: str = "") -> None:
-        super().__init__()
         self.room_name = room_name
         self.participant_name = participant_name
         self.patient_id: Optional[int] = None
         self.last_result = None
 
-    @llm.ai_callable(
-        description=(
-            "Save the patient's chest pain assessment once you have their name, age, "
-            "sex, pain description, triggers and history, then get the risk level and "
-            "recommendation to read back to them."
-        )
-    )
     def save_patient_assessment(
         self,
-        name: Annotated[str, llm.TypeInfo(description="Patient's name")],
-        age: Annotated[int, llm.TypeInfo(description="Age in years")],
-        sex: Annotated[str, llm.TypeInfo(description="'male' or 'female'")],
-        phone_number: Annotated[str, llm.TypeInfo(description="Phone number, or empty string")],
-        pain_quality: Annotated[str, llm.TypeInfo(description="pressure, sharp, burning, tearing or dull")],
-        substernal: Annotated[bool, llm.TypeInfo(description="Pain in the centre of the chest / behind the breastbone")],
-        radiates_to_arm_or_jaw: Annotated[bool, llm.TypeInfo(description="Pain spreads to arm, jaw or neck")],
-        exertional: Annotated[bool, llm.TypeInfo(description="Brought on by physical activity or stress")],
-        relieved_by_rest: Annotated[bool, llm.TypeInfo(description="Eases within minutes of resting")],
-        ongoing: Annotated[bool, llm.TypeInfo(description="Pain is happening right now")],
-        shortness_of_breath: Annotated[bool, llm.TypeInfo(description="Short of breath")],
-        sweating: Annotated[bool, llm.TypeInfo(description="Sweating or clammy with the pain")],
-        nausea: Annotated[bool, llm.TypeInfo(description="Nausea or vomiting")],
-        hypertension: Annotated[bool, llm.TypeInfo(description="History of high blood pressure")],
-        diabetes: Annotated[bool, llm.TypeInfo(description="History of diabetes")],
-        hyperlipidemia: Annotated[bool, llm.TypeInfo(description="History of high cholesterol")],
-        smoking: Annotated[bool, llm.TypeInfo(description="Current or past smoker")],
-        heart_disease: Annotated[bool, llm.TypeInfo(description="Known heart disease, prior heart attack, stent or bypass")],
+        *,
+        name: str,
+        age: int,
+        sex: str,
+        phone_number: str = "",
+        pain_quality: str = "unknown",
+        substernal: bool = False,
+        radiates_to_arm_or_jaw: bool = False,
+        exertional: bool = False,
+        relieved_by_rest: bool = False,
+        ongoing: bool = False,
+        shortness_of_breath: bool = False,
+        sweating: bool = False,
+        nausea: bool = False,
+        hypertension: bool = False,
+        diabetes: bool = False,
+        hyperlipidemia: bool = False,
+        smoking: bool = False,
+        heart_disease: bool = False,
     ) -> str:
         findings = ClinicalFindings.from_dict(
             {
