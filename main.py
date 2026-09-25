@@ -58,6 +58,7 @@ from pathways import run_pathway
 from pathways.api import extract_findings, router as pathway_router
 from pathways.extraction import extract_with_keywords, transcript_from_messages
 from care_api import router as care_router
+from auth_api import router as auth_router
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -103,6 +104,7 @@ async def unhandled_exception_handler(request, exc):
 # Clinical pathway engine + care-coordination endpoints
 app.include_router(pathway_router)
 app.include_router(care_router)
+app.include_router(auth_router)
 
 
 def run_and_store_pathway(
