@@ -75,6 +75,7 @@ origins = [
     "http://localhost:3000",  # frontend dev server
     "https://api.agilance.org",
     "https://main.d36t856vyywoj3.amplifyapp.com",  # production frontend
+    "https://triage-ai-delta.vercel.app"
 ]
 
 
