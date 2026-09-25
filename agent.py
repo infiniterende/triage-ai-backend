@@ -22,6 +22,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from livekit.agents import (
     Agent,
+    JobExecutorType,
     AgentSession,
     ConversationItemAddedEvent,
     JobContext,
@@ -292,9 +293,11 @@ if __name__ == "__main__":
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
-            # Small instances (0.5 CPU) need longer than the 10 s default to
-            # import the runtime; and one warm process is plenty for a clinic.
-            initialize_process_timeout=120.0,
+            # Run jobs as threads in this process: on a 0.5 CPU / 512 MB worker a
+            # second interpreter importing the runtime blew the memory limit and
+            # the 10 s process-init deadline, so no room was ever served.
+            job_executor_type=JobExecutorType.THREAD,
             num_idle_processes=1,
+            initialize_process_timeout=120.0,
         )
     )
