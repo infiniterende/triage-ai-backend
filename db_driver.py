@@ -6,19 +6,18 @@ from dotenv import load_dotenv
 import os
 from models import Patient
 
+from db_url import get_database_url
+
 load_dotenv()
 dotenv_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=dotenv_path)
-DATABASE_URL = os.getenv("SUPABASE_DATABASE_URL")
-# Replace with your actual database URL
-DATABASE_URL = os.getenv("SUPABASE_DATABASE_URL")
+DATABASE_URL = get_database_url()
 
 
 class DatabaseDriver:
     def __init__(self):
-        self.engine = create_engine(DATABASE_URL)
-        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
-        Base = declarative_base()
+        self.engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+        self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
 
     def create_patient(
         self,

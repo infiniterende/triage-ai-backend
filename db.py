@@ -5,13 +5,14 @@ from pathlib import Path
 from dotenv import load_dotenv
 import os
 
+from db_url import get_database_url
+
 dotenv_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=dotenv_path)
-DATABASE_URL = os.getenv("SUPABASE_DATABASE_URL")
-# Replace with your actual database URL
-DATABASE_URL = os.getenv("SUPABASE_DATABASE_URL")
+DATABASE_URL = get_database_url()
 
-engine = create_engine(DATABASE_URL)
+# pool_pre_ping recovers from connections the pooler closed while idle.
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()

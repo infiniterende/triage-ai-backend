@@ -24,12 +24,13 @@ from sqlalchemy.orm import sessionmaker, relationship
 
 from dotenv import load_dotenv
 
+from db_url import get_database_url
+
 load_dotenv()
-# Read the database URL from environment variable
-DATABASE_URL = os.getenv("SUPABASE_DATABASE_URL")
+# Read the database URL from environment variable (normalised for psycopg2)
+DATABASE_URL = get_database_url()
 # Create engine
-print(DATABASE_URL)
-engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 # Create a configured "Session" class
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
