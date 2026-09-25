@@ -1,0 +1,30 @@
+# Top-level dependencies. Regenerate the lockfile with:
+#   uv pip compile requirements.in --python-version 3.11 --python-platform x86_64-manylinux_2_28 --upgrade -o requirements.txt
+# (the Dockerfile targets python:3.11-slim on Linux)
+
+# API
+fastapi>=0.115
+uvicorn[standard]>=0.30
+gunicorn>=23
+python-multipart>=0.0.9
+pydantic>=2.7,<3
+
+# Database
+sqlalchemy>=2.0,<2.1
+psycopg2-binary>=2.9
+
+# Auth
+bcrypt>=4.1
+passlib>=1.7
+python-jose[cryptography]>=3.3
+PyJWT>=2.8
+
+# AI
+openai>=2,<3
+livekit-agents[openai,silero]>=1.8,<2
+livekit-api>=1.2
+
+# Misc
+python-dotenv>=1.0
+pandas>=2.2
+requests>=2.32
