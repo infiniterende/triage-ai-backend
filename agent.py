@@ -60,11 +60,35 @@ async def handle_user_message(msg: llm.ChatMessage, assistant_fnc: AssistantFnc)
         db.commit()
         db.refresh(chat_session)
 
+        voice_session = (
+            db.query(VoiceSession)
+            .filter_by(session_id=assistant_fnc.voice_session_id)
+            .first()
+        )
+
+        if not voice_session:
+            voice_session = VoiceSession(
+                session_id=assistant_fnc.voice_session_id,
+                status=VoiceSessionStatus.active,
+            )
+            db.add(voice_session)
+            db.commit()
+            db.refresh(voice_session)
+            transcript = VoiceTranscript(
+                voice_session_id=voice_session.id,
+                speaker=SpeakerType.patient,
+                text=msg.content,
+            )
+            db.add(transcript)
+            db.commit()
+
 
 async def entrypoint(ctx: JobContext):
     await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_ALL)
     await ctx.wait_for_participant()
-
+    voice_session_id = ctx.room.name
+    assistant_fnc.voice_session_id = voice_session_id
+    assistant_fnc.room_name = ctx.room.name
     model = openai.realtime.RealtimeModel(
         instructions=INSTRUCTIONS,
         voice="shimmer",

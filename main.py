@@ -53,6 +53,11 @@ from db import engine, Base, SessionLocal, get_db
 load_dotenv()
 
 from calculate_cad_score import classify_chest_pain, cadc_clinical_risk
+from models import PathwayEvaluation
+from pathways import run_pathway
+from pathways.api import extract_findings, router as pathway_router
+from pathways.extraction import extract_with_keywords, transcript_from_messages
+from care_api import router as care_router
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -81,6 +86,42 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Clinical pathway engine + care-coordination endpoints
+app.include_router(pathway_router)
+app.include_router(care_router)
+
+
+def run_and_store_pathway(
+    db: Session,
+    session_id: str,
+    messages_history: List[Dict[str, str]],
+    patient_id: Optional[int] = None,
+    source: str = "text",
+    use_llm: bool = True,
+):
+    """
+    Symptom/history extraction → red flags → router → disposition, persisted as
+    a PathwayEvaluation row so dashboards can read it back later.
+    """
+    transcript = transcript_from_messages(messages_history)
+    findings = extract_findings(transcript, use_llm=use_llm) if use_llm else extract_with_keywords(transcript)
+    result = run_pathway(findings)
+    payload = result.to_dict()
+    evaluation = PathwayEvaluation(
+        session_id=session_id,
+        source=source,
+        patient_id=patient_id,
+        primary_pathway=result.primary.pathway if result.primary else None,
+        disposition=result.disposition.level.value,
+        risk_percent=result.risk_percent,
+        result=payload,
+    )
+    db.add(evaluation)
+    db.commit()
+    db.refresh(evaluation)
+    payload["evaluation_id"] = evaluation.id
+    return result, payload
 
 
 class UserResponse(BaseModel):
@@ -478,6 +519,38 @@ async def process_message(user_response: UserResponse):
     current_q = ASSESSMENT_QUESTIONS[session.current_question]
     session.responses[current_q["id"]] = user_response.message
 
+    # Safety / red-flag layer runs on every turn (cheap keyword extraction, no
+    # LLM call). If the pathway engine already sees an emergency we stop the
+    # interview and tell the patient to call 911 rather than asking 6 more
+    # questions.
+    interim_findings = extract_with_keywords(
+        transcript_from_messages(session.conversation_history)
+    )
+    interim = run_pathway(interim_findings)
+    if interim.red_flags and interim.disposition.level.value == "emergency":
+        session.assessment_complete = True
+        _, pathway_payload = run_and_store_pathway(
+            db, session.session_id, messages, use_llm=False
+        )
+        emergency_text = (
+            "🚨 **Please stop and call 911 now.** "
+            + " ".join(f.label + "." for f in interim.red_flags)
+            + " "
+            + interim.disposition.patient_message
+        )
+        emergency_msg = Message(
+            session_id=session.session_id,
+            role=MessageType.ASSISTANT,
+            content=emergency_text,
+        )
+        session.messages.append(emergency_msg)
+        session.conversation_history.append(emergency_msg)
+        db.commit()
+        db.refresh(session)
+        msgs = [{"role": m.role, "content": m.content} for m in session.messages]
+        db.close()
+        return {"messages": msgs, "pathway": pathway_payload}
+
     # Move to next question or complete assessment
     session.current_question += 1
     print(session.current_question)
@@ -546,15 +619,31 @@ async def process_message(user_response: UserResponse):
         # session.risk_score = calculate_risk_score(session.responses)
         risk_level, recommendation = get_risk_level_and_recommendation(risk_probability)
 
+        # Clinical pathway engine: full LLM extraction → red flags → router →
+        # condition-specific assessment → disposition. Its output drives the
+        # closing recommendation and is stored for the dashboards.
+        pathway_result, pathway_payload = run_and_store_pathway(
+            db, session.session_id, history_serialized, patient_id=patient.id
+        )
+        session.risk_score = pathway_result.risk_percent or int(risk_probability * 100)
+        primary = pathway_result.primary
+        red_flag_text = (
+            "; ".join(f.label for f in pathway_result.red_flags) or "none identified"
+        )
+
         print(history_serialized)
         # Get AI-generated summary and recommendation
-        assessment_prompt = f"""The patient has completed the chest pain assessment. Here are their responses:
+        assessment_prompt = f"""The patient has completed the chest pain assessment. The clinical pathway engine has evaluated their answers:
 
-Risk Score: {risk_probability}
-Risk Level: {risk_level.value.upper()}
-Recommendation: {recommendation}
+CAD pre-test probability: {round(risk_probability * 100)}%
+Headline risk: {pathway_result.risk_percent}%
+Leading pathway: {primary.name if primary else 'none'} ({primary.likelihood.value if primary else 'n/a'})
+Red flags: {red_flag_text}
+Disposition: {pathway_result.disposition.level.value.upper()} — {pathway_result.disposition.headline} ({pathway_result.disposition.timeframe})
+Patient guidance: {pathway_result.disposition.patient_message}
+Actions: {'; '.join(pathway_result.disposition.actions)}
 
-Based on the conversation history, provide a comprehensive but concise summary of the assessment and emphasize the recommendation. Be empathetic and clear about next steps."""
+Based on the conversation history, provide a compassionate, concise summary of what the patient described, explain the disposition above in plain language, and state the actions clearly. Do not contradict the disposition. Do not provide a diagnosis."""
         msgs = [
             {"role": msg.role, "content": msg.content}
             for msg in session.conversation_history
@@ -584,22 +673,27 @@ Based on the conversation history, provide a comprehensive but concise summary o
             {"role": msg.role, "content": msg.content}
             for msg in session.conversation_history
         ]
-        # session.messages.append(
-        #     Message(type=MessageType.ASSISTANT, content=ai_response)
-        # )
-        # session.conversation_history.append(
-        #     {"role": "assistant", "content": ai_response}
-        # )
-        # db: Session = SessionLocal()
 
-        return {"messages": messages}
+        return {
+            "messages": messages,
+            "pathway": pathway_payload,
+            "patient_id": patient.id,
+        }
     else:
-        # Ask next question using OpenAI
+        # Ask next question using OpenAI. The pathway engine's condition-
+        # specific follow-up (if any) is offered as a hint so the interview
+        # adapts to the leading pathway instead of being purely scripted.
         next_question_info = {
             "question": ASSESSMENT_QUESTIONS[session.current_question]["question"],
             "type": ASSESSMENT_QUESTIONS[session.current_question]["type"],
             "number": session.current_question + 1,
         }
+        if interim.next_questions:
+            next_question_info["question"] += (
+                " (If it flows naturally, also ask: "
+                + interim.next_questions[0]
+                + ")"
+            )
 
         ai_response = await get_openai_response(messages, next_question_info)
 
@@ -645,12 +739,20 @@ async def get_chat_sessions(db: Session = Depends(get_db)):
 
 
 @app.get("/api/chat/{session_id}")
-async def get_chat_session(db: Session = Depends(get_db), session_id: str = None):
+async def get_chat_session(session_id: str, db: Session = Depends(get_db)):
     session = (
-        db.query(ChatSession).filter_by(ChatSession.session_id == session_id).first()
+        db.query(ChatSession).filter(ChatSession.session_id == session_id).first()
     )
-
-    return {"messages": session.messages}
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {
+        "session_id": session_id,
+        "assessment_complete": session.assessment_complete,
+        "messages": [
+            {"role": m.role, "content": m.content}
+            for m in sorted(session.messages, key=lambda m: m.id)
+        ],
+    }
 
 
 # @app.get("/api/chat/{session_id}")

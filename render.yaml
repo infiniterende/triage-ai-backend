@@ -1,0 +1,53 @@
+# Render Blueprint — creates both backend services from this repo.
+# Dashboard → New → Blueprint → select the agilance-backend repo.
+# Secrets marked `sync: false` are entered once in the Render dashboard.
+
+services:
+  - type: web
+    name: agilance-api
+    runtime: docker
+    plan: starter
+    region: ohio
+    healthCheckPath: /api/pathway/catalog
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: "8000"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: SUPABASE_DATABASE_URL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: ALGORITHM
+        value: HS256
+
+  # LiveKit voice agent: long-running worker, no HTTP port.
+  - type: worker
+    name: agilance-voice-agent
+    runtime: docker
+    plan: starter
+    region: ohio
+    dockerCommand: python agent.py start
+    autoDeploy: true
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: SUPABASE_DATABASE_URL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false

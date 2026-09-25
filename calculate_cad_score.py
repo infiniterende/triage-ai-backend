@@ -55,25 +55,26 @@ def cadc_clinical_risk(
     return 1 / (1 + math.exp(-logit_p))
 
 
-# Example voice agent flow:
-# Collect answers from questions
-location = True  # Patient says substernal pressure spreading to left arm
-trigger = True  # Happens on exertion
-relief = False  # Does NOT always go away with rest
+if __name__ == "__main__":
+    # Example voice agent flow:
+    # Collect answers from questions
+    location = True  # Patient says substernal pressure spreading to left arm
+    trigger = True  # Happens on exertion
+    relief = False  # Does NOT always go away with rest
 
-# Classify chest pain type
-chest_pain = classify_chest_pain(location, trigger, relief)
+    # Classify chest pain type
+    chest_pain = classify_chest_pain(location, trigger, relief)
 
-# Calculate risk
-prob = cadc_clinical_risk(
-    age=55,
-    male=True,
-    chest_pain_type=chest_pain,
-    diabetes=True,
-    hypertension=True,
-    dyslipidaemia=False,
-    smoking=True,
-)
+    # Calculate risk
+    prob = cadc_clinical_risk(
+        age=55,
+        male=True,
+        chest_pain_type=chest_pain,
+        diabetes=True,
+        hypertension=True,
+        dyslipidaemia=False,
+        smoking=True,
+    )
 
-print(f"Chest pain type: {chest_pain}")
-print(f"Predicted probability of CAD: {prob:.2%}")
+    print(f"Chest pain type: {chest_pain}")
+    print(f"Predicted probability of CAD: {prob:.2%}")
