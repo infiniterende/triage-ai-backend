@@ -53,7 +53,7 @@ from db import engine, Base, SessionLocal, get_db
 load_dotenv()
 
 from calculate_cad_score import classify_chest_pain, cadc_clinical_risk
-from models import PathwayEvaluation
+from models import PathwayEvaluation, Base as ModelsBase
 from pathways import run_pathway
 from pathways.api import extract_findings, router as pathway_router
 from pathways.extraction import extract_with_keywords, transcript_from_messages
@@ -86,6 +86,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc):
+    """
+    Return JSON 500s through the middleware stack. Without this, an unhandled
+    error skips CORSMiddleware and the browser reports a misleading CORS
+    failure instead of the real server error.
+    """
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
 
 # Clinical pathway engine + care-coordination endpoints
 app.include_router(pathway_router)
@@ -167,7 +179,9 @@ class UserResponse(BaseModel):
     message: str
 
 
-Base.metadata.create_all(bind=engine)
+# `Base` was shadowed by the empty declarative_base from db.py, so this used
+# to create nothing on a fresh database. Use the models' metadata explicitly.
+ModelsBase.metadata.create_all(bind=engine)
 
 df = pd.read_csv("clean_patients.csv")
 
