@@ -3,8 +3,9 @@ Tool implementation shared by the voice agent (see agent.py, where it is
 exposed to the model as a `function_tool`).
 
 `save_patient_assessment` stores the patient record, runs the clinical
-pathway engine on the structured answers and returns the disposition so the
-agent can read it back to the patient.
+pathway engine on the structured answers — the same engine the text chat
+uses — persists the evaluation, and returns the disposition so the agent can
+read it back to the patient.
 """
 
 from __future__ import annotations
@@ -13,8 +14,9 @@ import logging
 from typing import Optional
 
 from db import SessionLocal
-from models import Patient
+from models import Patient, PathwayEvaluation
 from pathways import ClinicalFindings, run_pathway
+from pathways.engine import PathwayResult
 
 logger = logging.getLogger("agilance-voice.tools")
 
@@ -24,7 +26,8 @@ class PatientTools:
         self.room_name = room_name
         self.participant_name = participant_name
         self.patient_id: Optional[int] = None
-        self.last_result = None
+        self.evaluation_id: Optional[int] = None
+        self.last_result: Optional[PathwayResult] = None
 
     def save_patient_assessment(
         self,
@@ -92,13 +95,24 @@ class PatientTools:
                 probability=int(result.risk_percent or 0),
             )
             db.add(patient)
+            db.flush()
+            evaluation = PathwayEvaluation(
+                session_id=self.room_name,
+                source="voice",
+                patient_id=patient.id,
+                primary_pathway=result.primary.pathway if result.primary else None,
+                disposition=result.disposition.level.value,
+                risk_percent=result.risk_percent,
+                result=result.to_dict(),
+            )
+            db.add(evaluation)
             db.commit()
-            db.refresh(patient)
             self.patient_id = patient.id
+            self.evaluation_id = evaluation.id
 
         logger.info(
             "saved patient %s (%s) risk %s%% → %s",
-            patient.id, name, result.risk_percent, result.disposition.level.value,
+            self.patient_id, name, result.risk_percent, result.disposition.level.value,
         )
         primary = result.primary
         return (
