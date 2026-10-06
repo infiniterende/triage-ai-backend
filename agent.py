@@ -327,8 +327,11 @@ async def entrypoint(ctx: JobContext) -> None:
 
     @session.on("conversation_item_added")
     def _on_item(ev: ConversationItemAddedEvent) -> None:
-        if ev.item.role == "assistant":
-            asyncio.create_task(_persist_and_estimate("agent", ev.item.text_content or "")).add_done_callback(_log_failure("persist"))
+        # The event also carries non-message items (e.g. AgentHandoff) that
+        # have no role/text; only persist what the agent actually said.
+        item = ev.item
+        if getattr(item, "type", None) == "message" and getattr(item, "role", None) == "assistant":
+            asyncio.create_task(_persist_and_estimate("agent", item.text_content or "")).add_done_callback(_log_failure("persist"))
 
     async def _finish() -> None:
         try:
